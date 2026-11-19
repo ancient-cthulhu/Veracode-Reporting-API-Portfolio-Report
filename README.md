@@ -1,321 +1,85 @@
-# Veracode Findings Export
+# Veracode Portfolio Report (Reporting API)
 
-A Python script to export vulnerability findings data from Veracode using the Reporting REST API. This tool automatically handles date windowing, report generation, polling, and data normalization.
+Portfolio-wide review of a Veracode tenant from the [Reporting REST API](https://docs.veracode.com/r/Reporting_REST_API): one FINDINGS report and one SCANS report cover every application, and the script turns them into a summary plus CSVs.
 
-Note: 
-> The Reporting API only returns findings updated within the last six months. Requests are filtered using `last_updated_start_date` and `last_updated_end_date`, and the start date cannot be more than six months in the past. Older findings that have not been updated during that window cannot be retrieved through this API.
+For a complete, per-finding export (every scan type, links, sandboxes), use [Veracode-All-Findings-Extract](https://github.com/ancient-cthulhu/Veracode-All-Findings-Extract) instead.
 
-## Overview
+> [!IMPORTANT]
+> The Reporting API only returns objects updated in the last six months. An open finding that was not re-found, fixed or mitigated in that time does not appear, so backlog counts here are a floor, not a total.
 
-This script pulls findings data from Veracode and exports it to both JSON (raw) and CSV (normalized) formats. It's designed to extract comprehensive vulnerability information including application details, CVE/CWE IDs, finding status, remediation timelines, and more.
+## Setup
 
-## Prerequisites
-
-### 1. Veracode API Credentials
-
-You need Veracode API credentials configured on your system. The script uses HMAC authentication.
-
-**Required Veracode Roles:**
-
-**Important:** To enable the Reporting API for your account, you must first send a request to support@veracode.com.
-
-Once enabled, you need one of these account configurations:
-- **API Service Account** with the **Reporting API** role
-- **User Account** with one of these roles:
-  - **Executive**
-  - **Security Lead**
-  - **Security Insights** (Note: API only returns data for teams you're a member of)
-
-**Credential Setup:**
-
-Create a Veracode API credentials file at:
-- **Windows**: `C:\Users\<username>\.veracode\credentials`
-- **Mac/Linux**: `~/.veracode/credentials`
-
-File format:
-```ini
-[default]
-veracode_api_key_id = YOUR_API_KEY_ID
-veracode_api_key_secret = YOUR_API_KEY_SECRET
-```
-
-Alternatively, set environment variables:
-```bash
-export VERACODE_API_KEY_ID=your_key_id
-export VERACODE_API_KEY_SECRET=your_key_secret
-```
-
-### 2. Python Requirements
-
-- Python 3.7 or higher
-- Required packages:
-  ```
-  requests
-  veracode-api-signing
-  ```
-
-## Installation
-
-1. Clone or download this repository
-
-2. Install required Python packages:
+1. Ask support@veracode.com to enable the Reporting API for your organization.
+2. Use one of:
+   - API service account with the **Reporting API** role (add **Results API** to include apps with no recent activity, see `--no-inventory`).
+   - User account with **Executive**, **Security Lead** or **Security Insights** (Security Insights only sees its own teams).
+3. Create **HMAC** API credentials (OAuth credentials return 401) and set:
    ```bash
-   pip install requests veracode-api-signing
+   export VERACODE_API_ID=...
+   export VERACODE_API_KEY=...
    ```
+   Or use `~/.veracode/credentials` (`[default]`, `veracode_api_key_id`, `veracode_api_key_secret`). `VERACODE_API_KEY_ID` / `VERACODE_API_KEY_SECRET` also work.
+4. Install: `pip install -r requirements.txt` (Python 3.10+).
 
-3. Verify your Veracode credentials are configured (see Prerequisites above)
+The region (US, EU, FedRAMP) comes from the API ID (environment or credentials file). Set `VERACODE_API_BASE` to override.
 
-## Usage
-
-### Basic Usage
-
-Export findings from a start date to today:
-```bash
-python findings_export.py --start-date 2025-01-01
-```
-
-### Specify Date Range
-
-Export findings for a specific date range:
-```bash
-python findings_export.py --start-date 2025-01-01 --end-date 2025-12-31
-```
-
-### Custom Output Filename
-
-Specify a custom CSV output filename:
-```bash
-python findings_export.py --start-date 2025-01-01 --output my_findings_report.csv
-```
-
-### Advanced Options
+## Run
 
 ```bash
-python findings_export.py \
-  --start-date 2024-01-01 \
-  --end-date 2025-12-31 \
-  --output findings.csv \
-  --sleep 2.0 \
-  --poll-interval 10 \
-  --max-polls 60
+python portfolio_report.py                         # last six months, policy scans
+python portfolio_report.py --start-date 2026-09-01 # shorter window
+python portfolio_report.py --include-sandbox       # add sandbox findings and scans
 ```
 
-## Command-Line Arguments
+Each run:
 
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--start-date` | Yes | - | Start date (YYYY-MM-DD format, inclusive) |
-| `--end-date` | No | Today | End date (YYYY-MM-DD format, inclusive) |
-| `--output` | No | `veracode_findings.csv` | Output CSV filename |
-| `--sleep` | No | `1.0` | Sleep time in seconds between date windows |
-| `--poll-interval` | No | `5.0` | Seconds between report status checks |
-| `--max-polls` | No | `40` | Maximum number of status check attempts |
+1. Requests a FINDINGS and a SCANS report for the window, waits for both and reads every page.
+2. Lists all applications through the Applications API (skipped with a warning if the account lacks access).
+3. Removes duplicate rows and writes the files below to `portfolio_report/`.
 
-## Output Files
+## Output
 
-The script generates two output files:
+| File | Content |
+|---|---|
+| `PORTFOLIO.md` | Summary, severity (open, fixed, median days to fix, age), riskiest apps, business units, monthly trend, overdue findings, top CWEs, open SCA findings by library (with the fixed or safe version when known), mitigations awaiting a decision, scan coverage |
+| `applications.csv` | One row per app: open by severity, policy violations, overdue, fixed, pending mitigations, median days to fix, last scan, compliance |
+| `findings.csv` | One row per finding, with `overdue`, `days_open`, `days_to_fix`, `fixed_in_window`, `mitigation_pending` added |
+| `scans.csv` | One row per scan |
+| `raw_*.json` | Raw report rows as returned by the API, with `--raw-json` |
 
-### 1. CSV File (Normalized)
-**Default:** `veracode_findings.csv`
+Definitions:
 
-Contains normalized findings data with the following columns:
-- Application Name
-- Application ID
-- Custom Severity Name
-- CVE ID
-- Description
-- Vulnerability Title
-- CWE ID
-- Flaw Name
-- First Found Date
-- Filename/Class
-- Finding Status
-- Fixed Date
-- Team Name
-- Days to Resolve (automatically calculated)
-- Scan Type
+| Term | Meaning |
+|---|---|
+| Overdue | Open, violates policy, grace period expiry date has passed |
+| Fixed in window | Closed, with a `fixed_date` inside the window (a reopened finding is not fixed) |
+| Days to fix | `found_date` to `fixed_date`, closed findings only; medians use fixes in the window |
+| Mitigation awaiting decision | Last proposal is newer than the last accept or reject |
+| Last scan | Latest policy scan in the window, else the last completed scan from the app inventory |
+| Compliance | The app's current policy status from the app inventory, else the latest policy scan in the window |
 
-### 2. JSON File (Raw)
-**Format:** `veracode_findings_<start>_to_<end>_raw.json`
+## Options
 
-Contains the raw findings data from the API for debugging.
-
-## Field Mappings
-
-The script maps various API response field names to the required output fields:
-
-| Output Field | Possible API Fields |
-|--------------|---------------------|
-| Application Name | `app_name`, `application_name`, `application.name` |
-| Application ID | `app_id`, `application_id`, `application.id` |
-| Custom Severity Name | `custom_severity`, `custom_severity_name` |
-| CVE ID | `cve_id`, `cve` |
-| Description | `description`, `flaw_description` |
-| Vulnerability Title | `vulnerability_title`, `title`, `issue_name` |
-| CWE ID | `cwe_id`, `cwe` |
-| Flaw Name | `flaw_name`, `finding_category.name` |
-| First Found Date | `first_found_date`, `found_date` |
-| Filename/Class | `file_name`, `filename`, `file_path`, `source_file` |
-| Finding Status | `finding_status`, `status`, `resolution_status` |
-| Fixed Date | `fixed_date`, `resolution_date` |
-| Team Name | `team_name`, `team`, `business_unit` |
-| Scan Type | `scan_type`, `analysis_type` |
-
-## How It Works
-
-1. **Date Windowing**: The script automatically splits large date ranges into 180-day windows (Veracode API limitation)
-
-2. **Report Creation**: For each window, it creates a findings report via the Reporting API
-
-3. **Polling**: Waits for report completion, checking status every 5 seconds (configurable)
-
-4. **Data Extraction**: Extracts findings records from the completed report
-
-5. **Normalization**: Maps API fields to standardized output fields
-
-6. **Export**: Saves both raw JSON and normalized CSV files
-
-## Example Output
-
-### Console Output
-```
-======================================================================
-  VERACODE FINDINGS EXPORT
-======================================================================
-  Date Range: 2025-01-01 to 2026-02-09
-  Output File: veracode_findings.csv
-======================================================================
-
-
-----------------------------------------------------------------------
-  Window 1: 2025-01-01 to 2025-06-29
-----------------------------------------------------------------------
-  Requesting report: 2025-01-01 00:00:00 to 2025-06-29 23:59:59
-  Report ID: c5a6c9d4-9bb1-4443-88ea-0a054faf16cc
-  Poll 1/40: SUBMITTED
-  Poll 2/40: PROCESSING
-  Poll 3/40: PROCESSING
-  Poll 4/40: PROCESSING
-  Poll 5/40: PROCESSING
-  Poll 6/40: PROCESSING
-  Poll 7/40: COMPLETED
-  Completed: 248 findings retrieved
-
-
-----------------------------------------------------------------------
-  Window 2: 2025-06-30 to 2025-12-26
-----------------------------------------------------------------------
-  Requesting report: 2025-06-30 00:00:00 to 2025-12-26 23:59:59
-  Report ID: 644c4e31-3946-4008-a92c-4a49375a6510
-  Poll 1/40: SUBMITTED
-  Poll 2/40: PROCESSING
-  Poll 3/40: PROCESSING
-  Poll 4/40: PROCESSING
-  Poll 5/40: COMPLETED
-  Completed: 330 findings retrieved
-
-
-----------------------------------------------------------------------
-  Window 3: 2025-12-27 to 2026-02-09
-----------------------------------------------------------------------
-  Requesting report: 2025-12-27 00:00:00 to 2026-02-09 23:59:59
-  Report ID: 9a8e6b72-ff45-451b-87fe-97d84fdf507c
-  Poll 1/40: SUBMITTED
-  Poll 2/40: PROCESSING
-  Poll 3/40: PROCESSING
-  Poll 4/40: PROCESSING
-  Poll 5/40: PROCESSING
-  Poll 6/40: PROCESSING
-  Poll 7/40: COMPLETED
-  Completed: 615 findings retrieved
-
-
-======================================================================
-  SAVING RESULTS
-======================================================================
-  Raw JSON: veracode_findings_2025-01-01_to_2026-02-09_raw.json (1193 findings)
-  CSV File: veracode_findings.csv (1193 findings)
-======================================================================
-  EXPORT COMPLETED
-======================================================================
-
-```
-
-### CSV Output Sample
-```csv
-Application Name	Application ID	Custom Severity Name	CVE ID	Description	Vulnerability Title	CWE ID	Flaw Name	First Found Date	Filename/Class	Finding Status	Fixed Date	Team Name	Days to Resolve	Scan Type
-Github-Verademo	2470774	3		Improper Neutralization of Script-Related HTML Tags in a Web Page (Basic XSS)		80	Improper Neutralization of Script-Related HTML Tags in a Web Page (Basic XSS)	2025-02-18 15:34:12.283	login.jsp	Open		Not Specified		Static Analysis
-Github-Verademo	2470774	3		Improper Neutralization of Script-Related HTML Tags in a Web Page (Basic XSS)		80	Improper Neutralization of Script-Related HTML Tags in a Web Page (Basic XSS)	2025-02-18 15:34:12.283	login.jsp	Open		Not Specified		Static Analysis
-Github-Verademo	2470774	3		Improper Neutralization of Script-Related HTML Tags in a Web Page (Basic XSS)		80	Improper Neutralization of Script-Related HTML Tags in a Web Page (Basic XSS)	2025-02-18 15:34:12.283	login.jsp	Open		Not Specified		Static Analysis
-Github-Verademo	2470774	2		Information Exposure Through an Error Message		209	Generation of Error Message Containing Sensitive Information	2025-02-18 15:34:12.283	login.jsp	Open		Not Specified		Static Analysis
-```
+| Option | Default | Description |
+|---|---|---|
+| `--start-date` | six months ago | `YYYY-MM-DD`; older dates are rejected |
+| `--end-date` | today | `YYYY-MM-DD`, inclusive |
+| `--output-dir` | `portfolio_report` | Output folder |
+| `--include-sandbox` | off | Include sandbox findings and scans |
+| `--stale-days` | 90 | Flag apps with no scan in N days |
+| `--top` | 20 | Rows per ranked table |
+| `--no-inventory` | off | Skip the Applications API call |
+| `--raw-json` | off | Save raw report rows |
+| `--poll-interval` | 10 | Initial seconds between status checks (backs off to 60) |
+| `--timeout` | 60 | Minutes to wait per report |
+| `-v` | off | Debug logging |
 
 ## Troubleshooting
 
-### Authentication Errors
-
-**Error:** `401 Unauthorized` or `403 Forbidden`
-
-**Solutions:**
-- Verify your API credentials file is correctly formatted
-- Ensure your Veracode user/service-account have the required roles 
-
-### No Findings Returned
-
-**Issue:** Script completes but shows 0 findings
-
-**Solutions:**
-- Verify the date range contains scan results
-- Check that your user has access to applications with findings
-- Inspect the raw JSON file to see the actual API response structure
-
-### Timeout Errors
-
-**Error:** `TimeoutError: Report did not complete after X polls`
-
-**Solutions:**
-- Increase `--max-polls` value (e.g., `--max-polls 60`)
-- Increase `--poll-interval` to reduce API load (e.g., `--poll-interval 10`)
-- Try smaller date ranges
-- Check Veracode platform status at https://status.veracode.com
-
-### Possible Field Mapping Issues
-
-**Issue:** Some fields are empty or null in the CSV
-
-**Solutions:**
-- Check the raw JSON file to see actual field names from the API
-- Update the `normalize_finding_record()` function with correct field names
-- Some fields may genuinely be empty (e.g., CVE ID if not assigned)
-
-## API Rate Limits
-
-The Veracode API has rate limits. 
-
-This script includes:
-- Configurable sleep between windows (`--sleep`)
-- Configurable polling interval (`--poll-interval`)
-- Automatic retry logic for status checks
-
-**Best Practices:**
-- Use reasonable polling intervals (5-10 seconds)
-- Avoid running multiple instances simultaneously
-- Schedule large exports during off-peak hours
-
-
-## Veracode API Documentation
-
-For more information about the Veracode Reporting API:
-- [Veracode Reporting API Documentation](https://docs.veracode.com/r/Reporting_REST_API)
-- [API Authentication](https://docs.veracode.com/r/t_install_api_authen)
-
-## License
-
-This script is provided as-is for use with Veracode's API. Ensure compliance with your Veracode license agreement.
-
-## Support
-
-For issues with:
-- **This script**: Open an Issue
-- **Veracode API**: Contact Veracode Support
-- **API credentials or roles**: Contact your Veracode Administrator
+| What you see | Fix |
+|---|---|
+| `HTTP 401/403` on create report | Check the role, that the Reporting API is enabled, HMAC (not OAuth) credentials, and the region |
+| `--start-date ... more than six months ago` | Use a later date, or the Findings API export for older data |
+| `Applications API returned 403; skipping inventory` | Add the Results API role, or run with `--no-inventory` |
+| `not completed after ...` | Raise `--timeout`; large tenants can take a while |
+| `page N of M came back empty` | The report was incomplete when read (results are not written); run again |

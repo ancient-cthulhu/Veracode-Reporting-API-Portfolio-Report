@@ -1,2 +1,2 @@
-requests
-veracode_api_signing
+requests>=2.31
+veracode-api-signing>=24.0
