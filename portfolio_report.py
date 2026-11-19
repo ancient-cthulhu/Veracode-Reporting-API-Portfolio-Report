@@ -16,6 +16,7 @@ import datetime as dt
 import email.utils
 import json
 import logging
+import math
 import os
 import statistics
 import sys
@@ -62,11 +63,13 @@ SCAN_COLUMNS = [
     "num_all_flaws", "primary_language", "lines_scanned", "scan_time_seconds", "submitter_name",
 ]
 APP_COLUMNS = [
-    "app_id", "app_name", "business_unit", "open", "open_very_high", "open_high",
-    "open_policy_violations", "overdue", "fixed_in_window", "mitigations_pending",
-    "median_days_to_fix", "last_scan", "days_since_scan", "policy_compliance",
-    "veracode_level",
+    "app_id", "app_name", "business_unit", "teams", "business_criticality", "risk_score", "open",
+    "open_very_high", "open_high", "open_policy_violations", "overdue", "security_debt",
+    "fixed_in_window", "mitigations_pending", "median_days_to_fix", "scan_types", "last_scan",
+    "days_since_scan", "policy_compliance", "veracode_level",
 ]
+COUNT_COLUMNS = ("open", "open_very_high", "open_high", "open_policy_violations", "overdue",
+                 "security_debt", "fixed_in_window", "mitigations_pending")
 
 
 # --------------------------------------------------------------------------- setup
@@ -343,9 +346,30 @@ def scan_key(s: dict) -> tuple:
 
 # --------------------------------------------------------------------------- analysis
 
+PASS_LABELS = {"Passed", "Pass"}
+UNASSESSED = {None, "", "Not Assessed", "Calculating", "Determining", "Vendor Review"}
+CRITICALITY = {"VERY_HIGH": ("Very High", 2.0), "HIGH": ("High", 1.5), "MEDIUM": ("Medium", 1.0),
+               "LOW": ("Low", 0.75), "VERY_LOW": ("Very Low", 0.5)}
+SCAN_TYPE_LABELS = {"STATIC": "SAST", "Static Analysis": "SAST", "DYNAMIC": "DAST",
+                    "Dynamic Analysis": "DAST", "Dynamic Analysis - Scan Linked": "DAST",
+                    "DynamicDS": "DAST", "DynamicMP - Scan Linked": "DAST", "MANUAL": "Manual",
+                    "Manual Penetration Testing": "Manual", "Manual Analysis": "Manual", "SCA": "SCA"}
+COVERAGE_TYPES = ("SAST", "SCA", "DAST", "Manual")
+DEBT_DAYS = 365
+AGE_BUCKETS = ((30, "0-30"), (90, "31-90"), (180, "91-180"), (365, "181-365"), (None, "365+"))
+# Veracode State of Software Security 2025, leading vs lagging organizations.
+BENCH_PREVALENCE = "leaders < 43%, laggards 86%"
+BENCH_CAPACITY = "leaders 10%+, laggards ~1%"
+BENCH_HALF_LIFE = "leaders ~35 days, laggards 365+"
+
+
 def compliance_label(value: Any) -> str | None:
     """'DID_NOT_PASS' (Applications API) and 'Did Not Pass' (Reporting API) -> 'Did Not Pass'."""
     return str(value).replace("_", " ").title() if value else None
+
+
+def is_used(value: Any) -> bool:
+    return bool(value) and str(value).strip().lower() not in ("not specified", "none", "")
 
 
 def latest_policy_scans(scans: list[dict]) -> dict[str, dict]:
@@ -361,28 +385,37 @@ def latest_policy_scans(scans: list[dict]) -> dict[str, dict]:
     return latest
 
 
+def is_debt(f: dict) -> bool:
+    return f["days_open"] is not None and f["days_open"] > DEBT_DAYS
+
+
 def build_app_rows(findings: list[dict], scans: list[dict], apps: list[dict] | None,
                    today: dt.date) -> list[dict]:
     rows: dict[str, dict] = {}
 
     def row_for(app_id: str, name: Any, bu: Any) -> dict:
-        r = rows.setdefault(app_id, {c: None for c in APP_COLUMNS})
-        r["app_id"] = app_id
+        r = rows.get(app_id)
+        if r is None:
+            r = rows[app_id] = {c: None for c in APP_COLUMNS}
+            r.update(app_id=app_id, teams="", scan_types=set(), risk_score=0.0)
+            for c in COUNT_COLUMNS:
+                r[c] = 0
         r["app_name"] = r["app_name"] or name
-        r["business_unit"] = r["business_unit"] or bu
+        r["business_unit"] = r["business_unit"] or (bu if is_used(bu) else None)
         return r
 
     fix_times: dict[str, list[int]] = defaultdict(list)
     for f in findings:
         r = row_for(str(f.get("app_id")), f.get("app_name"), f.get("business_unit"))
-        for c in ("open", "open_very_high", "open_high", "open_policy_violations", "overdue",
-                  "fixed_in_window", "mitigations_pending"):
-            r[c] = r[c] or 0
+        label = SCAN_TYPE_LABELS.get(str(f.get("scan_type")))
+        if label:
+            r["scan_types"].add(label)
         if is_open(f):
             r["open"] += 1
             r["open_very_high"] += f["severity"] == 5
             r["open_high"] += f["severity"] == 4
             r["open_policy_violations"] += str(f.get("policy_rule_passed") or "").lower() == "no"
+            r["security_debt"] += is_debt(f)
         r["overdue"] += f["overdue"]
         r["mitigations_pending"] += f["mitigation_pending"]
         if f["fixed_in_window"]:
@@ -390,6 +423,10 @@ def build_app_rows(findings: list[dict], scans: list[dict], apps: list[dict] | N
             if f["days_to_fix"] is not None:
                 fix_times[r["app_id"]].append(f["days_to_fix"])
 
+    for s in scans:
+        label = SCAN_TYPE_LABELS.get(str(s.get("scan_type")))
+        if label:
+            row_for(str(s.get("app_id")), s.get("app_name"), s.get("business_unit"))["scan_types"].add(label)
     for app_id, s in latest_policy_scans(scans).items():
         r = row_for(app_id, s.get("app_name"), s.get("business_unit"))
         last = parse_date(s.get("published") or s.get("submitted"))
@@ -400,27 +437,112 @@ def build_app_rows(findings: list[dict], scans: list[dict], apps: list[dict] | N
 
     for app in apps or []:
         profile = app.get("profile") or {}
-        r = row_for(str(app.get("id")), profile.get("name"),
-                    (profile.get("business_unit") or {}).get("name"))
+        r = row_for(str(app.get("id")), profile.get("name"), (profile.get("business_unit") or {}).get("name"))
+        r["teams"] = ", ".join(sorted(t.get("team_name") for t in profile.get("teams") or [] if t.get("team_name")))
+        crit = CRITICALITY.get(str(profile.get("business_criticality") or "").upper())
+        r["business_criticality"] = crit[0] if crit else None
         # The app's current status wins over the last scan's: grace-period expiry, approved
         # mitigations and policy changes move it without a new scan.
         policies = profile.get("policies") or []
         current = compliance_label(policies[0].get("policy_compliance_status")) if policies else None
         r["policy_compliance"] = current or r["policy_compliance"]
+        for scan in app.get("scans") or []:
+            label = SCAN_TYPE_LABELS.get(str(scan.get("scan_type")))
+            if label:
+                r["scan_types"].add(label)
         last = parse_date(app.get("last_completed_scan_date"))
         if last and not r["last_scan"]:
             r["last_scan"] = last.isoformat()
             r["days_since_scan"] = (today - last).days
 
-    for app_id, times in fix_times.items():
-        rows[app_id]["median_days_to_fix"] = int(statistics.median(times))
-    return sorted(rows.values(), key=lambda r: (-(r["open_very_high"] or 0), -(r["open_high"] or 0),
-                                                -(r["open"] or 0), str(r["app_name"] or "")))
+    weights = {v[0]: v[1] for v in CRITICALITY.values()}
+    for r in rows.values():
+        if r["app_id"] in fix_times:
+            r["median_days_to_fix"] = int(statistics.median(fix_times[r["app_id"]]))
+        r["risk_score"] = round((10 * r["open_very_high"] + 5 * r["open_high"] + 3 * r["overdue"]
+                                 + 2 * r["security_debt"]) * weights.get(r["business_criticality"], 1.0), 1)
+        r["scan_types"] = ", ".join(t for t in COVERAGE_TYPES if t in r["scan_types"])
+    return sorted(rows.values(), key=lambda r: (-r["risk_score"], -r["open"], str(r["app_name"] or "")))
 
 
 def month(value: Any) -> str | None:
     d = parse_date(value)
     return d.strftime("%Y-%m") if d else None
+
+
+def pct(part: float, whole: float) -> str:
+    return f"{100 * part / whole:.0f}%" if whole else "n/a"
+
+
+def half_life(findings: list[dict], start: dt.date, today: dt.date) -> int | None:
+    """Days until half of the findings first found in the window are closed (Kaplan-Meier).
+
+    Open findings count as still open at their current age, so a slow backlog is not hidden
+    the way a median over fixed findings only would hide it.
+    """
+    events: list[tuple[int, bool]] = []
+    for f in findings:
+        found = parse_date(f.get("found_date"))
+        if not found or found < start:
+            continue
+        if is_open(f):
+            events.append(((today - found).days, False))
+        elif f["days_to_fix"] is not None:
+            events.append((f["days_to_fix"], True))
+    if not events:
+        return None
+    events.sort()
+    at_risk, survival, i = len(events), 1.0, 0
+    while i < len(events):
+        t, fixed = events[i][0], 0
+        j = i
+        while j < len(events) and events[j][0] == t:
+            fixed += events[j][1]
+            j += 1
+        if fixed:
+            survival *= 1 - fixed / at_risk
+            if survival <= 0.5:
+                return t
+        at_risk -= j - i
+        i = j
+    return None
+
+
+def grace_adherence(findings: list[dict], window: tuple[dt.date, dt.date], today: dt.date) -> tuple[int, int]:
+    """(met, due): findings whose fix-by date fell in the window, and how many were fixed by then."""
+    met = due = 0
+    for f in findings:
+        grace = parse_date(f.get("grace_period_expiry_date"))
+        if not grace or not (window[0] <= grace <= min(window[1], today)):
+            continue
+        due += 1
+        fixed = None if is_open(f) else parse_date(f.get("fixed_date"))
+        met += bool(fixed and fixed <= grace)
+    return met, due
+
+
+def months_in(window: tuple[dt.date, dt.date]) -> float:
+    return max(((window[1] - window[0]).days + 1) / 30.44, 1.0)
+
+
+def group_stats(name: str, members: list[dict], findings_by_app: dict[str, list[dict]],
+                window: tuple[dt.date, dt.date], stale_days: int) -> list[Any]:
+    assessed = [r for r in members if r["policy_compliance"] not in UNASSESSED]
+    passing = sum(r["policy_compliance"] in PASS_LABELS for r in assessed)
+    scanned = sum(r["days_since_scan"] is not None and r["days_since_scan"] <= stale_days for r in members)
+    open_ = sum(r["open"] for r in members)
+    fixed = sum(r["fixed_in_window"] for r in members)
+    times = [f["days_to_fix"] for r in members for f in findings_by_app.get(r["app_id"], [])
+             if f["fixed_in_window"] and f["days_to_fix"] is not None]
+    return [name, len(members), pct(passing, len(assessed)), pct(scanned, len(members)),
+            sum(r["open_very_high"] for r in members), sum(r["open_high"] for r in members), open_,
+            sum(r["overdue"] for r in members), sum(r["security_debt"] for r in members),
+            f"{100 * fixed / months_in(window) / (open_ + fixed):.1f}%" if open_ + fixed else "n/a",
+            int(statistics.median(times)) if times else ""]
+
+
+GROUP_HEADERS = ["Apps", "Passing policy", "Scanned in {d} days", "Open VH", "Open H", "Open",
+                 "Overdue", "Debt > 1 year", "Fix capacity / month", "Median days to fix"]
 
 
 # --------------------------------------------------------------------------- markdown
@@ -437,119 +559,215 @@ def render_markdown(findings: list[dict], scans: list[dict], app_rows: list[dict
                     window: tuple[dt.date, dt.date], meta: dict, today: dt.date,
                     stale_days: int, top: int, inventory: bool) -> str:
     open_f = [f for f in findings if is_open(f)]
-    sev_open = Counter(f["severity"] for f in open_f)
-    sev_fixed = Counter(f["severity"] for f in findings if f["fixed_in_window"])
+    fixed_w = [f for f in findings if f["fixed_in_window"]]
+    n_apps = len(app_rows)
+    uses_bu = any(r["business_unit"] for r in app_rows)
+    uses_teams = any(r["teams"] for r in app_rows)
+    findings_by_app: dict[str, list[dict]] = defaultdict(list)
+    for f in findings:
+        findings_by_app[str(f.get("app_id"))].append(f)
+
+    assessed = [r for r in app_rows if r["policy_compliance"] not in UNASSESSED]
+    passing = sum(r["policy_compliance"] in PASS_LABELS for r in assessed)
+    scanned_window = {app for app, s in latest_policy_scans(scans).items()}
+    prevalence_base = [r for r in app_rows if r["app_id"] in scanned_window]
+    with_open = sum(r["open"] > 0 for r in prevalence_base)
+    capacity = len(fixed_w) / months_in(window) / (len(open_f) + len(fixed_w)) if (open_f or fixed_w) else 0
+    hl = half_life(findings, window[0], today)
+    met, due = grace_adherence(findings, window, today)
+    debt = [f for f in open_f if is_debt(f)]
+    critical_debt = [f for f in debt if (f["severity"] or 0) >= 4]
+    sca_critical = sum(f.get("scan_type") == "SCA" for f in critical_debt)
+    recent = sum(r["days_since_scan"] is not None and r["days_since_scan"] <= stale_days for r in app_rows)
+    open_vh_h = sum((f["severity"] or 0) >= 4 for f in open_f)
+
     out: list[str] = [
         "# Veracode portfolio review", "",
-        (f"Window: **{window[0]} to {window[1]}** (objects updated in this period). "
-        f"Data refreshed: {meta.get('data_refresh_date') or 'n/a'}."), "",
-        "> [!NOTE]",
-        ("> The Reporting API only returns findings updated in the last six months. Open findings "
-        "that were not re-found, fixed or mitigated in the window are missing here; use the "
-        "Findings API export for the full backlog."), "",
-        "## Summary", "",
-        md_table(["Metric", "Value"], [
-            ["Applications", len(app_rows)],
-            ["Findings in window", len(findings)],
-            ["Open", len(open_f)],
-            ["Open, violating policy", sum(str(f.get("policy_rule_passed")).lower() == "no" for f in open_f)],
-            ["Overdue (past grace period)", sum(f["overdue"] for f in findings)],
-            ["Fixed in window", sum(f["fixed_in_window"] for f in findings)],
-            ["Mitigations awaiting decision", sum(f["mitigation_pending"] for f in findings)],
-            ["Scans in window", len(scans)],
+        (f"Window: **{window[0]} to {window[1]}**, policy findings and scans updated in this period. "
+         f"Data refreshed: {str(meta.get('data_refresh_date') or 'n/a')[:16]}."), "",
+        "## Scorecard", "",
+        md_table(["Measure", "Value", "Benchmark"], [
+            ["Applications", n_apps, ""],
+            ["Passing policy", f"{pct(passing, len(assessed))} ({passing} of {len(assessed)} assessed)", ""],
+            [f"Scanned in the last {stale_days} days", f"{pct(recent, n_apps)} ({recent} of {n_apps})", ""],
+            ["Flaw prevalence (apps with open flaws)",
+             f"{pct(with_open, len(prevalence_base))} ({with_open} of {len(prevalence_base)} scanned in window)",
+             BENCH_PREVALENCE],
+            ["Fix capacity (share of flaws fixed per month)", f"{100 * capacity:.1f}%", BENCH_CAPACITY],
+            ["Fix speed (half-life of new flaws)", f"{hl} days" if hl is not None else "not reached in window",
+             BENCH_HALF_LIFE],
+            ["Fixed by the policy fix-by date", f"{pct(met, due)} ({met} of {due} due in window)", ""],
+            ["Open Very High / High", open_vh_h, ""],
+            ["Overdue (open past fix-by date)", sum(f["overdue"] for f in findings), ""],
+            ["Security debt (open > 1 year)",
+             f"{len(debt)} findings in {len({f.get('app_id') for f in debt})} apps", ""],
+            ["Critical debt (Very High / High, open > 1 year)",
+             f"{len(critical_debt)} ({pct(sca_critical, len(critical_debt))} from open-source libraries)", ""],
+            ["Mitigations awaiting a decision", sum(f["mitigation_pending"] for f in findings), ""],
         ]), "",
-        "## Severity", "",
+        "> [!NOTE]",
+        ("> Benchmarks are from Veracode's State of Software Security 2025. The Reporting API only "
+         "returns findings updated in the last six months, so open and debt counts are complete for "
+         "apps scanned in the window and a minimum for the rest. Use the Findings API export for the "
+         "full backlog."), "",
     ]
-    sev_rows = []
-    for sev in (5, 4, 3, 2, 1, 0):
-        times = [f["days_to_fix"] for f in findings
-                 if f["severity"] == sev and f["fixed_in_window"] and f["days_to_fix"] is not None]
-        ages = [f["days_open"] for f in open_f if f["severity"] == sev and f["days_open"] is not None]
-        sev_rows.append([SEVERITY_NAMES[sev], sev_open.get(sev, 0), sev_fixed.get(sev, 0),
-                         int(statistics.median(times)) if times else "",
-                         int(statistics.median(ages)) if ages else ""])
-    out += [md_table(["Severity", "Open", "Fixed in window", "Median days to fix", "Median age of open (days)"],
-                     sev_rows), ""]
 
-    out += ["## Applications with the most risk", ""]
-    out += [md_table(["Application", "Business unit", "Open VH", "Open H", "Open", "Policy violations",
-                      "Overdue", "Last scan", "Compliance"],
-                     [[r["app_name"], r["business_unit"], r["open_very_high"] or 0, r["open_high"] or 0,
-                       r["open"] or 0, r["open_policy_violations"] or 0, r["overdue"] or 0,
-                       r["last_scan"] or "", r["policy_compliance"] or ""]
-                      for r in [r for r in app_rows if r["open"]][:top]]), ""]
-
-    bu: dict[str, Counter] = defaultdict(Counter)
-    for r in app_rows:
-        c = bu[r["business_unit"] or "Not Specified"]
-        c["apps"] += 1
-        for k in ("open", "open_very_high", "open_high", "overdue", "fixed_in_window"):
-            c[k] += r[k] or 0
-        c["failing"] += r["policy_compliance"] == "Did Not Pass"
-    out += ["## Business units", "",
-            md_table(["Business unit", "Apps", "Failing policy", "Open", "Open VH", "Open H", "Overdue",
-                      "Fixed in window"],
-                     [[name, c["apps"], c["failing"], c["open"], c["open_very_high"], c["open_high"],
-                       c["overdue"], c["fixed_in_window"]]
-                      for name, c in sorted(bu.items(), key=lambda kv: -kv[1]["open"])]), ""]
+    takeaways = []
+    worst = [r for r in app_rows if r["risk_score"] > 0][:3]
+    if worst:
+        takeaways.append("Highest-risk applications: " + ", ".join(
+            f"**{r['app_name']}** ({r['open_very_high']} VH, {r['open_high']} H, {r['overdue']} overdue)" for r in worst) + ".")
+    if open_f or fixed_w:
+        verdict = "leading" if capacity >= 0.10 else "lagging" if capacity <= 0.01 else "between leading and lagging"
+        takeaways.append(f"Fix capacity of {100 * capacity:.1f}% a month is {verdict} by the SoSS 2025 benchmark.")
+    if due:
+        takeaways.append(f"{due - met} of {due} findings due in the window missed their policy fix-by date.")
+    if n_apps - recent:
+        crit_stale = sum(r["business_criticality"] in ("Very High", "High") and not
+                         (r["days_since_scan"] is not None and r["days_since_scan"] <= stale_days) for r in app_rows)
+        takeaways.append(f"{n_apps - recent} applications have no scan in {stale_days} days"
+                         + (f", {crit_stale} of them high business criticality." if crit_stale else "."))
+    if critical_debt:
+        takeaways.append(f"{len(critical_debt)} Very High/High findings have been open over a year; "
+                         f"{pct(sca_critical, len(critical_debt))} are in open-source libraries.")
+    if takeaways:
+        out += ["## Key takeaways", ""] + [f"- {t}" for t in takeaways] + [""]
 
     dated = [month(f.get(k)) for f in findings for k in ("found_date", "fixed_date")]
     dated += [month(s.get("published") or s.get("submitted")) for s in scans]
     months = sorted({m for m in dated if m and m >= window[0].strftime("%Y-%m")})
     found_m = Counter(month(f.get("found_date")) for f in findings)
-    fixed_m = Counter(month(f.get("fixed_date")) for f in findings if f["fixed_in_window"])
+    fixed_m = Counter(month(f.get("fixed_date")) for f in fixed_w)
     scans_m = Counter(month(s.get("published") or s.get("submitted")) for s in scans)
+    apps_m: dict[str, set] = defaultdict(set)
+    for s in scans:
+        apps_m[month(s.get("published") or s.get("submitted"))].add(s.get("app_id"))
     out += ["## Trend by month", "",
-            md_table(["Month", "New findings", "Fixed", "Net", "Scans"],
-                     [[m, found_m[m], fixed_m[m], found_m[m] - fixed_m[m], scans_m[m]] for m in months]), ""]
+            md_table(["Month", "New flaws", "Fixed", "Net change", "Fix ratio", "Scans", "Apps scanned"],
+                     [[m, found_m[m], fixed_m[m], f"{found_m[m] - fixed_m[m]:+d}",
+                       f"{fixed_m[m] / found_m[m]:.2f}" if found_m[m] else "", scans_m[m], len(apps_m[m])]
+                      for m in months]),
+            "", "Fix ratio above 1.00 means the backlog shrank that month.", ""]
+
+    out += ["## Open flaws by severity and age", ""]
+    rows = []
+    for sev in (5, 4, 3, 2, 1, 0):
+        ages = [f["days_open"] for f in open_f if f["severity"] == sev and f["days_open"] is not None]
+        times = sorted(f["days_to_fix"] for f in fixed_w if f["severity"] == sev and f["days_to_fix"] is not None)
+        buckets = Counter()
+        for a in ages:
+            buckets[next(label for limit, label in AGE_BUCKETS if limit is None or a <= limit)] += 1
+        rows.append([SEVERITY_NAMES[sev], sum(f["severity"] == sev for f in open_f)]
+                    + [buckets[label] for _, label in AGE_BUCKETS]
+                    + [int(statistics.median(times)) if times else "",
+                       times[math.ceil(0.9 * len(times)) - 1] if times else ""])
+    out += [md_table(["Severity", "Open"] + [f"{label} days" for _, label in AGE_BUCKETS]
+                     + ["Median days to fix", "P90 days to fix"], rows), ""]
+
+    risky = [r for r in app_rows if r["risk_score"] > 0][:top]
+    headers = ["Application"] + (["Business unit"] if uses_bu else []) + (["Teams"] if uses_teams else []) + [
+        "Criticality", "Risk score", "Open VH", "Open H", "Overdue", "Debt > 1 year", "Last scan", "Policy"]
+    out += ["## Applications needing attention", "",
+            md_table(headers, [[r["app_name"]] + ([r["business_unit"] or ""] if uses_bu else [])
+                               + ([r["teams"]] if uses_teams else [])
+                               + [r["business_criticality"] or "", r["risk_score"], r["open_very_high"],
+                                  r["open_high"], r["overdue"], r["security_debt"], r["last_scan"] or "",
+                                  r["policy_compliance"] or ""] for r in risky]) if risky else "None.",
+            "", ("Risk score = (10 x open Very High + 5 x open High + 3 x overdue + 2 x debt) "
+                 "x business criticality weight (Very High 2, High 1.5, Medium 1, Low 0.75, Very Low 0.5)."), ""]
+
+    group_headers = [h.format(d=stale_days) for h in GROUP_HEADERS]
+    if uses_bu:
+        by_bu: dict[str, list[dict]] = defaultdict(list)
+        for r in app_rows:
+            by_bu[r["business_unit"] or "Not Specified"].append(r)
+        out += ["## Business units", "",
+                md_table(["Business unit"] + group_headers,
+                         sorted((group_stats(k, v, findings_by_app, window, stale_days) for k, v in by_bu.items()),
+                                key=lambda g: (-g[4], -g[5], g[0]))), ""]
+    if uses_teams:
+        by_team: dict[str, list[dict]] = defaultdict(list)
+        for r in app_rows:
+            for team in (r["teams"].split(", ") if r["teams"] else ["No team"]):
+                by_team[team].append(r)
+        out += ["## Teams", "",
+                md_table(["Team"] + group_headers,
+                         sorted((group_stats(k, v, findings_by_app, window, stale_days) for k, v in by_team.items()),
+                                key=lambda g: (-g[4], -g[5], g[0]))),
+                "", "Applications in several teams count in each.", ""]
+
+    out += ["## Scan coverage", ""]
+    cov_rows = [[t, sum(t in r["scan_types"] for r in app_rows),
+                 pct(sum(t in r["scan_types"] for r in app_rows), n_apps)] for t in COVERAGE_TYPES]
+    out += [md_table(["Scan type", "Apps", "Share of portfolio"], cov_rows), ""]
+    by_crit: dict[str, list[dict]] = defaultdict(list)
+    for r in app_rows:
+        by_crit[r["business_criticality"] or "Not set"].append(r)
+    if inventory and any(k != "Not set" for k in by_crit):
+        order = [v[0] for v in CRITICALITY.values()] + ["Not set"]
+        out += [md_table(["Business criticality", "Apps", f"Scanned in {stale_days} days", "Passing policy",
+                          "Open VH", "Open H"],
+                         [[k, len(v), pct(sum(r["days_since_scan"] is not None and r["days_since_scan"] <= stale_days
+                                              for r in v), len(v)),
+                           pct(sum(r["policy_compliance"] in PASS_LABELS for r in v),
+                               sum(r["policy_compliance"] not in UNASSESSED for r in v)),
+                           sum(r["open_very_high"] for r in v), sum(r["open_high"] for r in v)]
+                          for k in order if (v := by_crit.get(k))]), ""]
+    stale = sorted((r for r in app_rows if r["days_since_scan"] is None or r["days_since_scan"] > stale_days),
+                   key=lambda r: (-(r["days_since_scan"] or 10**6), str(r["app_name"])))
+    out += [f"Applications with no scan in the last {stale_days} days: **{len(stale)}**.", ""]
+    if stale:
+        out += [md_table(["Application", "Criticality", "Last scan", "Days ago", "Policy"],
+                         [[r["app_name"], r["business_criticality"] or "", r["last_scan"] or "never",
+                           r["days_since_scan"] if r["days_since_scan"] is not None else "",
+                           r["policy_compliance"] or ""] for r in stale[:top]]), ""]
+    if not inventory:
+        out += ["> [!NOTE]", ("> Application inventory was skipped, so apps with no activity in the window, "
+                              "teams and business criticality are not shown. Give the account the Results API "
+                              "role to include them."), ""]
 
     overdue = sorted((f for f in findings if f["overdue"]),
-                     key=lambda f: (str(f.get("grace_period_expiry_date")), -(f["severity"] or 0)))
+                     key=lambda f: (-(f["severity"] or 0), str(f.get("grace_period_expiry_date"))))
     out += [f"## Overdue findings ({len(overdue)})", ""]
-    out += [md_table(["Application", "Severity", "CWE", "Flaw / component", "Fix by", "Scan type"],
+    out += [md_table(["Application", "Severity", "CWE", "Flaw / component", "Fix by", "Days overdue", "Scan type"],
                      [[f.get("app_name"), f["severity_name"], f.get("cwe_id"),
-                       f.get("flaw_name") or f.get("component_name"),
-                       str(f.get("grace_period_expiry_date"))[:10], f.get("scan_type")]
+                       f.get("flaw_name") or f.get("component_name"), str(f.get("grace_period_expiry_date"))[:10],
+                       (today - parse_date(f.get("grace_period_expiry_date"))).days, f.get("scan_type")]
                       for f in overdue[:top]]) if overdue else "None.", ""]
 
     cwe = Counter((f.get("cwe_id"), f.get("category_name") or f.get("flaw_name")) for f in open_f
-                  if f.get("cwe_id"))
-    out += ["## Most common open weaknesses", "",
-            md_table(["CWE", "Name", "Open"], [[c[0], c[1], n] for c, n in cwe.most_common(top)]), ""]
+                  if f.get("cwe_id") and f.get("scan_type") != "SCA")
+    if cwe:
+        out += ["## Most common open weaknesses (first-party code)", "",
+                md_table(["CWE", "Name", "Open", "Apps"],
+                         [[c[0], c[1], n, len({f.get("app_id") for f in open_f
+                                              if (f.get("cwe_id"), f.get("category_name") or f.get("flaw_name")) == c})]
+                          for c, n in cwe.most_common(top)]), ""]
 
     sca = Counter((f.get("component_name"), f.get("component_version"),
                    f.get("fixed_library_version") or f.get("library_latest_safe_version"))
                   for f in open_f if f.get("scan_type") == "SCA" and f.get("component_name"))
     if sca:
-        out += ["## Open SCA findings by library", "",
-                md_table(["Library", "Version", "Fixed / safe version", "Open"],
-                         [[c[0], c[1], c[2] or "", n] for c, n in sca.most_common(top)]), ""]
+        sca_open = [f for f in open_f if f.get("scan_type") == "SCA"]
+        upgradable = sum(bool(f.get("fixed_library_version") or f.get("library_latest_safe_version")) for f in sca_open)
+        out += ["## Open-source risk", "",
+                (f"{len(sca_open)} open findings in third-party libraries; {pct(upgradable, len(sca_open))} "
+                 "have a fixed or safe version to upgrade to."), "",
+                md_table(["Library", "Version", "Upgrade to", "Open", "Apps"],
+                         [[c[0], c[1], c[2] or "", n,
+                           len({f.get("app_id") for f in sca_open if f.get("component_name") == c[0]
+                                and f.get("component_version") == c[1]})]
+                          for c, n in sca.most_common(top)]), ""]
 
-    pending = [f for f in findings if f["mitigation_pending"]]
-    status_counts = Counter(str(f.get("mitigation_status") or "").strip() for f in findings
-                            if f.get("mitigation_status"))
-    out += ["## Mitigations", "", f"Awaiting a decision: **{len(pending)}**.", ""]
-    if status_counts:
-        out += [md_table(["Mitigation status", "Findings"], [list(x) for x in status_counts.most_common()]), ""]
-
-    stale = [r for r in app_rows if r["days_since_scan"] is not None and r["days_since_scan"] > stale_days]
-    never = [r for r in app_rows if r["last_scan"] is None]
-    out += ["## Scan coverage", "",
-            (f"Applications with no scan in the last {stale_days} days: **{len(stale)}**. "
-            f"Applications with no scan on record{'' if inventory else ' in the window'}: **{len(never)}**."), "",
-            ("Last scan is the latest policy scan in the window, or the last completed scan from the "
-            "application inventory when there is none."), ""]
-    if not inventory:
-        out += ["> [!NOTE]", ("> Application inventory was skipped, so apps with no activity in the window "
-                "are not listed. Give the account the Results API role to include them."), ""]
-    stale_rows = sorted(stale, key=lambda r: -r["days_since_scan"])[:top]
-    if stale_rows:
-        out += [md_table(["Application", "Business unit", "Last scan", "Days ago", "Compliance"],
-                         [[r["app_name"], r["business_unit"], r["last_scan"],
-                           r["days_since_scan"], r["policy_compliance"] or ""] for r in stale_rows]), ""]
-    by_type = Counter(s.get("scan_type") for s in scans)
-    if by_type:
-        out += [md_table(["Scan type", "Scans in window"], [list(x) for x in by_type.most_common()]), ""]
+    in_window = lambda v: (d := parse_date(v)) is not None and window[0] <= d <= window[1]
+    accepted = sum(in_window(f.get("mitigation_last_accepted_date")) for f in findings)
+    rejected = sum(in_window(f.get("mitigation_last_rejected_date")) for f in findings)
+    out += ["## Mitigations", "",
+            md_table(["Measure", "Findings"], [
+                ["Awaiting a decision", sum(f["mitigation_pending"] for f in findings)],
+                ["Accepted in window", accepted],
+                ["Rejected in window", rejected],
+            ]), ""]
     return "\n".join(out).rstrip() + "\n"
 
 
@@ -640,9 +858,12 @@ def main(argv: list[str] | None = None) -> int:
     log.info("Findings %d (%d duplicates removed), scans %d, apps %d",
              len(findings), raw_count - len(findings), len(scans), len(app_rows))
 
-    write_csv(out / "findings.csv", findings, FINDING_COLUMNS)
-    write_csv(out / "scans.csv", scans, SCAN_COLUMNS)
-    write_csv(out / "applications.csv", app_rows, APP_COLUMNS)
+    # Drop grouping columns the tenant does not use (no business units, teams or criticality set).
+    unused = {c for c in ("business_unit", "teams", "business_criticality")
+              if not any(r[c] for r in app_rows)}
+    write_csv(out / "findings.csv", findings, [c for c in FINDING_COLUMNS if c not in unused])
+    write_csv(out / "scans.csv", scans, [c for c in SCAN_COLUMNS if c not in unused])
+    write_csv(out / "applications.csv", app_rows, [c for c in APP_COLUMNS if c not in unused])
     write_text(out / "PORTFOLIO.md", render_markdown(
         findings, scans, app_rows, (start, end), meta, today, args.stale_days, args.top, apps is not None))
     log.info("Wrote %s", out.resolve())
